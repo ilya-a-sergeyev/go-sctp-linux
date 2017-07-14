@@ -210,7 +210,7 @@ func ResolveSCTPAddr(net, addr string) (*SCTPAddr, error) {
 	default:
 		return nil, UnknownNetworkError(net)
 	}
-	addrs, err := DefaultResolver.internetAddrList(context.Background(), net, addr)
+	addrs, err := DefaultResolver.internetAddrListSCTP(context.Background(), net, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -337,3 +337,87 @@ func ListenSCTPInit(net string, laddr *SCTPAddr, sim syscall.SCTPInitMsg) (*SCTP
 	return newSCTPConnInitMsg(fd, sim), nil
 }
 
+// internetAddrList resolves addr, which may be a literal IP
+// address or a DNS name, and returns a list of internet protocol
+// family addresses. The result contains at least one address when
+// error is nil.
+func (r *Resolver) internetAddrListSCTP(ctx context.Context, net, addr string) (addrList, error) {
+	var (
+		err        error
+		host, port string
+		portnum    int
+	)
+	switch net {
+	case "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6", "sctp", "sctp4", "sctp6":
+		if addr != "" {
+			if host, port, err = SplitHostPort(addr); err != nil {
+				return nil, err
+			}
+			if portnum, err = r.LookupPort(ctx, net, port); err != nil {
+				return nil, err
+			}
+		}
+	case "ip", "ip4", "ip6":
+		if addr != "" {
+			host = addr
+		}
+	default:
+		return nil, UnknownNetworkError(net)
+	}
+	inetaddr := func(ip IPAddr) Addr {
+		switch net {
+		case "tcp", "tcp4", "tcp6":
+			return &TCPAddr{IP: ip.IP, Port: portnum, Zone: ip.Zone}
+		case "udp", "udp4", "udp6":
+			return &UDPAddr{IP: ip.IP, Port: portnum, Zone: ip.Zone}
+		case "sctp", "sctp4", "sctp6":
+			return &SCTPAddr{IP: ip.IP, Port: portnum, Zone: ip.Zone}
+		case "ip", "ip4", "ip6":
+			return &IPAddr{IP: ip.IP, Zone: ip.Zone}
+		default:
+			panic("unexpected network: " + net)
+		}
+	}
+	if host == "" {
+		return addrList{inetaddr(IPAddr{})}, nil
+	}
+	// Try as a literal IP address.
+	var ip IP
+	if ip = parseIPv4(host); ip != nil {
+		return addrList{inetaddr(IPAddr{IP: ip})}, nil
+	}
+	var zone string
+	if ip, zone = parseIPv6(host, true); ip != nil {
+		return addrList{inetaddr(IPAddr{IP: ip, Zone: zone})}, nil
+	}
+	// Try as a DNS name.
+	ips, err := r.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	var filter func(IPAddr) bool
+	if net != "" && net[len(net)-1] == '4' {
+		filter = ipv4only
+	}
+	if net != "" && net[len(net)-1] == '6' {
+		filter = ipv6only
+	}
+	return filterAddrListSCTP(filter, ips, inetaddr)
+}
+
+// filterAddrList applies a filter to a list of IP addresses,
+// yielding a list of Addr objects. Known filters are nil, ipv4only,
+// and ipv6only. It returns every address when the filter is nil.
+// The result contains at least one address when error is nil.
+func filterAddrListSCTP(filter func(IPAddr) bool, ips []IPAddr, inetaddr func(IPAddr) Addr) (addrList, error) {
+	var addrs addrList
+	for _, ip := range ips {
+		if filter == nil || filter(ip) {
+			addrs = append(addrs, inetaddr(ip))
+		}
+	}
+	if len(addrs) == 0 {
+		return nil, errNoSuitableAddress
+	}
+	return addrs, nil
+}
